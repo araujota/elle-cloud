@@ -1,0 +1,149 @@
+"""Configuration for ELLE Cloud.
+
+Environment-based configuration for different deployment modes:
+- Global: Anthropic-hosted cloud for all ELLE installations
+- Org: Self-hosted organization vault
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+class CloudMode(str, Enum):
+    """Deployment mode for ELLE Cloud."""
+
+    GLOBAL = "global"
+    ORG = "org"
+
+
+class CloudConfig(BaseSettings):
+    """ELLE Cloud configuration from environment."""
+
+    # Deployment mode
+    mode: CloudMode = Field(
+        default=CloudMode.ORG,
+        description="Deployment mode: global or org",
+    )
+
+    # Organization name (for org mode)
+    org_name: str = Field(
+        default="default-org",
+        description="Organization name for org vault",
+    )
+
+    # Server settings
+    bind_host: str = Field(
+        default="0.0.0.0",
+        description="Host to bind to",
+    )
+    bind_port: int = Field(
+        default=8443,
+        description="HTTPS port for mTLS",
+    )
+    health_port: int = Field(
+        default=8080,
+        description="HTTP port for health checks",
+    )
+
+    # Data directory
+    data_dir: Path = Field(
+        default=Path("/data"),
+        description="Directory for SQLite database",
+    )
+
+    # Certificate directory
+    cert_dir: Path = Field(
+        default=Path("/certs"),
+        description="Directory for TLS certificates",
+    )
+
+    # Logging
+    log_level: Literal["debug", "info", "warning", "error"] = Field(
+        default="info",
+        description="Log level",
+    )
+    log_format: Literal["json", "text"] = Field(
+        default="json",
+        description="Log format",
+    )
+
+    # Security
+    require_client_cert: bool = Field(
+        default=True,
+        description="Require client certificate for mTLS",
+    )
+
+    # Performance
+    max_incidents: int = Field(
+        default=100000,
+        description="Maximum incidents to store (oldest pruned)",
+    )
+    search_limit: int = Field(
+        default=100,
+        description="Maximum search results",
+    )
+
+    class Config:
+        env_prefix = "ELLE_CLOUD_"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+    @property
+    def db_path(self) -> Path:
+        """Path to SQLite database."""
+        return self.data_dir / "elle_cloud.db"
+
+    @property
+    def ca_cert_path(self) -> Path:
+        """Path to CA certificate."""
+        return self.cert_dir / "ca.crt"
+
+    @property
+    def ca_key_path(self) -> Path:
+        """Path to CA private key."""
+        return self.cert_dir / "ca.key"
+
+    @property
+    def server_cert_path(self) -> Path:
+        """Path to server certificate."""
+        return self.cert_dir / "server.crt"
+
+    @property
+    def server_key_path(self) -> Path:
+        """Path to server private key."""
+        return self.cert_dir / "server.key"
+
+    @property
+    def clients_dir(self) -> Path:
+        """Directory for client certificates."""
+        return self.cert_dir / "clients"
+
+
+# Global config instance
+_config: CloudConfig | None = None
+
+
+def get_config() -> CloudConfig:
+    """Get the global configuration instance."""
+    global _config
+    if _config is None:
+        _config = CloudConfig()
+    return _config
+
+
+def set_config(config: CloudConfig) -> None:
+    """Set the global configuration instance (for testing)."""
+    global _config
+    _config = config
+
+
+def reset_config() -> None:
+    """Reset the global configuration instance (for testing)."""
+    global _config
+    _config = None
