@@ -132,6 +132,23 @@ class ActionSummary(BaseModel):
 
 
 # =============================================================================
+# Drift Explanation
+# =============================================================================
+
+
+class DriftExplanation(BaseModel):
+    """Human-readable explanation of a specific surface drift."""
+
+    model_config = ConfigDict(frozen=True)
+
+    surface: str = Field(description="Surface key (e.g., 'service:nginx.service')")
+    changed: bool = Field(description="Whether this surface changed")
+    explanation: str = Field(default="", description="Human-readable explanation of the change")
+    before_value: str | None = Field(default=None, description="Value before (if available)")
+    after_value: str | None = Field(default=None, description="Value after (if available)")
+
+
+# =============================================================================
 # Anonymized Incident Report
 # =============================================================================
 
@@ -141,6 +158,10 @@ class AnonymizedIncidentReport(BaseModel):
 
     Contains enough information for pattern matching and aggregate analysis
     while protecting sensitive system and user information.
+
+    Supports two detail levels:
+    - "hashes": Only surface hashes (default, most private)
+    - "detailed": Full anonymized control surfaces (opt-in for richer sharing)
     """
 
     model_config = ConfigDict(frozen=True)
@@ -169,9 +190,25 @@ class AnonymizedIncidentReport(BaseModel):
     surface_hashes_post: dict[str, str] | None = Field(default=None)
     surface_drift: dict[str, bool] = Field(default_factory=dict)
 
+    # Drift explanations (computed from control surfaces when available)
+    drift_explanations: tuple[DriftExplanation, ...] | list[DriftExplanation] = Field(
+        default_factory=tuple,
+        description="Human-readable drift explanations (requires detailed mode or local data)",
+    )
+
     # Anonymized telemetry (metrics only, no identifiers)
     telemetry_pre: dict[str, Any] | None = Field(default=None)
     telemetry_post: dict[str, Any] | None = Field(default=None)
+
+    # Anonymized control surfaces (optional - only in detailed mode)
+    control_surface_pre: dict[str, Any] | None = Field(
+        default=None,
+        description="Anonymized control surface before (detailed mode only)",
+    )
+    control_surface_post: dict[str, Any] | None = Field(
+        default=None,
+        description="Anonymized control surface after (detailed mode only)",
+    )
 
     # Action summary (counts by kind, success rate)
     action_summary: ActionSummary = Field(default_factory=ActionSummary)
@@ -185,6 +222,7 @@ class AnonymizedIncidentReport(BaseModel):
 
     # Anonymization metadata
     anonymization_version: str = Field(default="1.0")
+    detail_level: str = Field(default="hashes", description="'hashes' or 'detailed'")
     original_hash: str = Field(default="", description="SHA256 of original for deduplication")
 
 

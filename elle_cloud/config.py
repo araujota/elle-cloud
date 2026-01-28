@@ -89,6 +89,14 @@ class CloudConfig(BaseSettings):
         description="Maximum search results",
     )
 
+    # Detail level for stored incidents
+    # "hashes": Only surface hashes (default, most private)
+    # "detailed": Full anonymized control surfaces (richer sharing)
+    detail_level: Literal["hashes", "detailed"] = Field(
+        default="hashes",
+        description="Level of detail to accept/store: 'hashes' or 'detailed'",
+    )
+
     class Config:
         env_prefix = "ELLE_CLOUD_"
         env_file = ".env"

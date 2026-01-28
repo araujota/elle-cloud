@@ -40,7 +40,7 @@ logger = structlog.get_logger()
 # Schema
 # =============================================================================
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 -- Core incident storage
@@ -62,11 +62,15 @@ CREATE TABLE IF NOT EXISTS anonymized_incidents (
     surface_hashes_pre_json TEXT,
     surface_hashes_post_json TEXT,
     surface_drift_json TEXT,
+    drift_explanations_json TEXT,
+    control_surface_pre_json TEXT,
+    control_surface_post_json TEXT,
     confidence REAL NOT NULL,
     time_to_mitigate_sec INTEGER,
     time_to_resolve_sec INTEGER,
     trigger_source TEXT NOT NULL DEFAULT 'manual',
     anonymization_version TEXT NOT NULL DEFAULT '1.0',
+    detail_level TEXT NOT NULL DEFAULT 'hashes',
     original_hash TEXT UNIQUE NOT NULL,
     tenant_id TEXT NOT NULL DEFAULT 'global',
     submitted_at TEXT NOT NULL,
@@ -239,6 +243,22 @@ def _migrate_schema(conn: sqlite3.Connection, from_version: int, to_version: int
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_certs_admin ON trusted_certificates(is_admin)")
         logger.info("Migrated to schema v2: added is_admin column and audit_log table")
 
+    # Migration from v2 to v3: add drift explanations and control surface columns
+    if from_version < 3:
+        cursor.execute(
+            "ALTER TABLE anonymized_incidents ADD COLUMN drift_explanations_json TEXT"
+        )
+        cursor.execute(
+            "ALTER TABLE anonymized_incidents ADD COLUMN control_surface_pre_json TEXT"
+        )
+        cursor.execute(
+            "ALTER TABLE anonymized_incidents ADD COLUMN control_surface_post_json TEXT"
+        )
+        cursor.execute(
+            "ALTER TABLE anonymized_incidents ADD COLUMN detail_level TEXT NOT NULL DEFAULT 'hashes'"
+        )
+        logger.info("Migrated to schema v3: added drift explanations and control surfaces")
+
     cursor.execute("UPDATE schema_version SET version = ?", (to_version,))
     conn.commit()
 
@@ -353,6 +373,16 @@ def store_incident(
         surface_hashes_post_json = json.dumps(incident.surface_hashes_post) if incident.surface_hashes_post else None
         surface_drift_json = json.dumps(incident.surface_drift) if incident.surface_drift else None
 
+        # New fields for v3 schema
+        drift_explanations_json = None
+        if incident.drift_explanations:
+            drift_explanations_json = json.dumps([
+                de.model_dump() if hasattr(de, "model_dump") else de
+                for de in incident.drift_explanations
+            ])
+        control_surface_pre_json = json.dumps(incident.control_surface_pre) if incident.control_surface_pre else None
+        control_surface_post_json = json.dumps(incident.control_surface_post) if incident.control_surface_post else None
+
         # Insert incident
         cursor.execute(
             """
@@ -361,10 +391,11 @@ def store_incident(
                 created_at_hour, updated_at_hour, fingerprint_vector, fingerprint_json,
                 action_summary_json, telemetry_pre_json, telemetry_post_json,
                 surface_hashes_pre_json, surface_hashes_post_json, surface_drift_json,
+                drift_explanations_json, control_surface_pre_json, control_surface_post_json,
                 confidence, time_to_mitigate_sec, time_to_resolve_sec,
-                trigger_source, anonymization_version, original_hash,
+                trigger_source, anonymization_version, detail_level, original_hash,
                 tenant_id, submitted_at, installation_fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 incident.incident_id,
@@ -383,11 +414,15 @@ def store_incident(
                 surface_hashes_pre_json,
                 surface_hashes_post_json,
                 surface_drift_json,
+                drift_explanations_json,
+                control_surface_pre_json,
+                control_surface_post_json,
                 incident.confidence,
                 incident.time_to_mitigate_sec,
                 incident.time_to_resolve_sec,
                 incident.trigger_source,
                 incident.anonymization_version,
+                incident.detail_level,
                 incident.original_hash,
                 tenant_id,
                 datetime.now(timezone.utc).isoformat(),
@@ -475,8 +510,29 @@ def get_incident(
 
 def _row_to_incident(row: sqlite3.Row) -> AnonymizedIncidentReport:
     """Convert a database row to an AnonymizedIncidentReport."""
+    from elle_cloud.models import DriftExplanation
+
     fingerprint = Fingerprint.model_validate_json(row["fingerprint_json"])
     action_summary = ActionSummary.model_validate_json(row["action_summary_json"])
+
+    # Parse drift explanations (v3 schema)
+    drift_explanations: tuple[DriftExplanation, ...] = ()
+    drift_json = row["drift_explanations_json"] if "drift_explanations_json" in row.keys() else None
+    if drift_json:
+        drift_explanations = tuple(
+            DriftExplanation.model_validate(de) for de in json.loads(drift_json)
+        )
+
+    # Parse control surfaces (v3 schema, detailed mode only)
+    control_pre = None
+    control_post = None
+    if "control_surface_pre_json" in row.keys():
+        control_pre = json.loads(row["control_surface_pre_json"]) if row["control_surface_pre_json"] else None
+    if "control_surface_post_json" in row.keys():
+        control_post = json.loads(row["control_surface_post_json"]) if row["control_surface_post_json"] else None
+
+    # Parse detail level (v3 schema)
+    detail_level = row["detail_level"] if "detail_level" in row.keys() else "hashes"
 
     return AnonymizedIncidentReport(
         incident_id=row["incident_id"],
@@ -493,11 +549,15 @@ def _row_to_incident(row: sqlite3.Row) -> AnonymizedIncidentReport:
         surface_hashes_pre=json.loads(row["surface_hashes_pre_json"]) if row["surface_hashes_pre_json"] else None,
         surface_hashes_post=json.loads(row["surface_hashes_post_json"]) if row["surface_hashes_post_json"] else None,
         surface_drift=json.loads(row["surface_drift_json"]) if row["surface_drift_json"] else {},
+        drift_explanations=drift_explanations,
+        control_surface_pre=control_pre,
+        control_surface_post=control_post,
         confidence=row["confidence"],
         time_to_mitigate_sec=row["time_to_mitigate_sec"],
         time_to_resolve_sec=row["time_to_resolve_sec"],
         trigger_source=row["trigger_source"],
         anonymization_version=row["anonymization_version"],
+        detail_level=detail_level,
         original_hash=row["original_hash"],
     )
 
