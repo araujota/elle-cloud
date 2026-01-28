@@ -167,9 +167,18 @@ def search_similar(
                 surface_post,
             )
 
-            # Combined score (weighted average)
-            # Fingerprint is primary signal, surface adds context
-            combined = 0.7 * fp_sim + 0.3 * surface_sim
+            # Combined score: equal weighting when both signals available
+            # If query has no surface hashes, use fingerprint only
+            # If incident has no surface hashes, use fingerprint only
+            has_query_surface = bool(query.surface_hashes)
+            has_incident_surface = bool(surface_pre or surface_post)
+
+            if has_query_surface and has_incident_surface:
+                # Both signals available: 50/50 weighting
+                combined = 0.5 * fp_sim + 0.5 * surface_sim
+            else:
+                # Fallback to fingerprint only
+                combined = fp_sim
 
             if combined >= query.min_similarity:
                 scored.append((row, fp_sim, surface_sim, combined))
