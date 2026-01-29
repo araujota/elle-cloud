@@ -1,7 +1,7 @@
 # ELLE Cloud Container
 # Lightweight, ultra-secure container for anonymized incident reports
 
-FROM python:3.12-slim-bookworm AS base
+FROM python:3.10-slim-bookworm AS base
 
 # Security: Run as non-root user
 RUN useradd -r -s /bin/false -d /app elle
