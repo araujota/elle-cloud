@@ -3,6 +3,11 @@
 
 FROM python:3.10-slim-bookworm AS base
 
+# Install PostgreSQL client libraries for psycopg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Security: Run as non-root user
 RUN useradd -r -s /bin/false -d /app elle
 

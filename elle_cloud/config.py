@@ -51,10 +51,32 @@ class CloudConfig(BaseSettings):
         description="HTTP port for health checks",
     )
 
+    # Database (PostgreSQL)
+    db_host: str = Field(
+        default="localhost",
+        description="PostgreSQL host",
+    )
+    db_port: int = Field(
+        default=5432,
+        description="PostgreSQL port",
+    )
+    db_name: str = Field(
+        default="elle_cloud",
+        description="PostgreSQL database name",
+    )
+    db_user: str = Field(
+        default="elle_cloud",
+        description="PostgreSQL user",
+    )
+    db_password: str = Field(
+        default="",
+        description="PostgreSQL password",
+    )
+
     # Data directory
     data_dir: Path = Field(
         default=Path("/data"),
-        description="Directory for SQLite database",
+        description="Directory for auxiliary data files",
     )
 
     # Certificate directory
@@ -103,9 +125,16 @@ class CloudConfig(BaseSettings):
         env_file_encoding = "utf-8"
 
     @property
-    def db_path(self) -> Path:
-        """Path to SQLite database."""
-        return self.data_dir / "elle_cloud.db"
+    def conninfo(self) -> str:
+        """PostgreSQL connection string."""
+        parts = [f"dbname={self.db_name}", f"user={self.db_user}"]
+        if self.db_host:
+            parts.append(f"host={self.db_host}")
+        if self.db_port != 5432:
+            parts.append(f"port={self.db_port}")
+        if self.db_password:
+            parts.append(f"password={self.db_password}")
+        return " ".join(parts)
 
     @property
     def ca_cert_path(self) -> Path:

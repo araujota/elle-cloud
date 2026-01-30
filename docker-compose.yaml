@@ -10,10 +10,37 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: elle-cloud-db
+    environment:
+      POSTGRES_USER: elle_cloud
+      POSTGRES_PASSWORD: ${ELLE_CLOUD_DB_PASSWORD:-elle_cloud_dev}
+      POSTGRES_DB: elle_cloud
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U elle_cloud -d elle_cloud"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
   elle-cloud:
     build: .
     image: elle-cloud:latest
     container_name: elle-cloud
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       # Deployment mode: "org" for self-hosted, "global" for Anthropic cloud
       ELLE_CLOUD_MODE: ${ELLE_CLOUD_MODE:-org}
@@ -28,6 +55,13 @@ services:
       # mTLS authentication (set to false for testing only)
       ELLE_CLOUD_REQUIRE_CLIENT_CERT: ${ELLE_CLOUD_REQUIRE_CLIENT_CERT:-true}
 
+      # PostgreSQL connection
+      ELLE_CLOUD_DB_HOST: postgres
+      ELLE_CLOUD_DB_PORT: "5432"
+      ELLE_CLOUD_DB_NAME: elle_cloud
+      ELLE_CLOUD_DB_USER: elle_cloud
+      ELLE_CLOUD_DB_PASSWORD: ${ELLE_CLOUD_DB_PASSWORD:-elle_cloud_dev}
+
     ports:
       # mTLS API port
       - "${ELLE_CLOUD_PORT:-8443}:8443"
@@ -35,9 +69,6 @@ services:
       - "${ELLE_CLOUD_HEALTH_PORT:-8080}:8080"
 
     volumes:
-      # Persistent storage for SQLite database
-      - elle-data:/data
-
       # Certificate storage (mount your certs here)
       - ./certs:/certs:ro
 
@@ -61,7 +92,7 @@ services:
           memory: 128M
 
 volumes:
-  elle-data:
+  pg-data:
     driver: local
 
 # Optional: Network configuration for production

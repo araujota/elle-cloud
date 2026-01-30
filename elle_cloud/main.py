@@ -23,7 +23,7 @@ from elle_cloud import __version__
 from elle_cloud.api import admin_router, health_router, limiter, router
 from elle_cloud.config import CloudConfig, CloudMode, get_config, set_config
 from elle_cloud.crypto import CloudCrypto
-from elle_cloud.storage import ensure_schema, get_connection, register_certificate
+from elle_cloud.storage import close_pool, configure_pool, ensure_schema, register_certificate
 
 
 def configure_logging(config: CloudConfig) -> None:
@@ -91,14 +91,18 @@ def create_app(config: CloudConfig | None = None) -> FastAPI:
     @app.on_event("startup")
     async def startup() -> None:
         """Initialize database on startup."""
-        conn = get_connection()
-        ensure_schema(conn)
-        conn.close()
+        configure_pool()
+        ensure_schema()
         structlog.get_logger().info(
             "ELLE Cloud started",
             mode=config.mode.value,
             org_name=config.org_name,
         )
+
+    @app.on_event("shutdown")
+    async def shutdown() -> None:
+        """Close database pool on shutdown."""
+        close_pool()
 
     return app
 
@@ -165,8 +169,8 @@ def cmd_init_certs(args: argparse.Namespace) -> int:
     paths, admin_cert = crypto.init_certs(org_name)
 
     # Initialize database and register admin certificate
-    conn = get_connection()
-    ensure_schema(conn)
+    configure_pool()
+    ensure_schema()
 
     if admin_cert:
         register_certificate(
@@ -177,7 +181,6 @@ def cmd_init_certs(args: argparse.Namespace) -> int:
             issued_at=admin_cert.expires_at,  # Will be fixed with proper issued_at
             expires_at=admin_cert.expires_at,
             is_admin=True,  # Mark as admin
-            conn=conn,
         )
         logger.info(
             "Registered admin certificate",
@@ -185,7 +188,7 @@ def cmd_init_certs(args: argparse.Namespace) -> int:
             fingerprint=admin_cert.fingerprint[:16] + "...",
         )
 
-    conn.close()
+    close_pool()
 
     logger.info(
         "Certificates created",
@@ -226,8 +229,8 @@ def cmd_issue_client_cert(args: argparse.Namespace) -> int:
     client_cert = crypto.issue_client_certificate(installation_id)
 
     # Register in trust store
-    conn = get_connection()
-    ensure_schema(conn)
+    configure_pool()
+    ensure_schema()
     register_certificate(
         cert_fingerprint=client_cert.fingerprint,
         organization=config.org_name,
@@ -235,9 +238,8 @@ def cmd_issue_client_cert(args: argparse.Namespace) -> int:
         common_name=installation_id,
         issued_at=client_cert.expires_at,
         expires_at=client_cert.expires_at,
-        conn=conn,
     )
-    conn.close()
+    close_pool()
 
     cert_path = config.clients_dir / f"{installation_id}.crt"
     key_path = config.clients_dir / f"{installation_id}.key"

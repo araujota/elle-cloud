@@ -1,7 +1,7 @@
-"""SQLite storage for ELLE Cloud.
+"""PostgreSQL storage for ELLE Cloud.
 
 Handles:
-- Anonymized incident storage with vector fingerprints
+- Anonymized incident storage with pgvector fingerprints
 - Surface hash indexing for drift correlation
 - Certificate trust store for mTLS
 - Deduplication via original_hash
@@ -10,17 +10,18 @@ Handles:
 
 from __future__ import annotations
 
-import json
-import sqlite3
-import struct
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import psycopg
 import structlog
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 if TYPE_CHECKING:
     from elle_cloud.auth import AuthContext
@@ -37,237 +38,209 @@ from elle_cloud.models import (
 logger = structlog.get_logger()
 
 # =============================================================================
+# Connection Pool Management
+# =============================================================================
+
+_pool: ConnectionPool | None = None
+
+
+def configure_pool(conninfo: str | None = None) -> ConnectionPool:
+    """Create and configure the connection pool.
+
+    Auto-configures using ELLE_CLOUD_* env vars if no conninfo provided.
+    Safe to call multiple times - returns existing pool if already configured.
+    """
+    global _pool
+    if _pool is not None:
+        return _pool
+
+    if conninfo is None:
+        conninfo = get_config().conninfo
+
+    def on_connect(conn: psycopg.Connection) -> None:
+        register_vector(conn)
+
+    _pool = ConnectionPool(
+        conninfo=conninfo,
+        min_size=2,
+        max_size=10,
+        kwargs={"row_factory": dict_row, "autocommit": False},
+        configure=on_connect,
+    )
+    return _pool
+
+
+def get_pool() -> ConnectionPool:
+    """Get the active connection pool. Auto-configures if needed."""
+    if _pool is None:
+        configure_pool()
+    assert _pool is not None
+    return _pool
+
+
+def close_pool() -> None:
+    """Close the connection pool."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+@contextmanager
+def get_db() -> Generator[psycopg.Connection, None, None]:
+    """Context manager for database connections from pool."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+# =============================================================================
 # Schema
 # =============================================================================
 
 SCHEMA_VERSION = 4
 
-SCHEMA_SQL = """
--- Core incident storage
-CREATE TABLE IF NOT EXISTS anonymized_incidents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id TEXT UNIQUE NOT NULL,
-    cloud_id TEXT UNIQUE NOT NULL,
-    domain TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    status TEXT NOT NULL,
-    outcome TEXT NOT NULL,
-    created_at_hour TEXT NOT NULL,
-    updated_at_hour TEXT,
-    fingerprint_vector BLOB NOT NULL,
-    fingerprint_json TEXT NOT NULL,
-    action_summary_json TEXT NOT NULL,
-    telemetry_pre_json TEXT,
-    telemetry_post_json TEXT,
-    surface_hashes_pre_json TEXT,
-    surface_hashes_post_json TEXT,
-    surface_drift_json TEXT,
-    drift_explanations_json TEXT,
-    control_surface_pre_json TEXT,
-    control_surface_post_json TEXT,
-    confidence REAL NOT NULL,
-    time_to_mitigate_sec INTEGER,
-    time_to_resolve_sec INTEGER,
-    trigger_source TEXT NOT NULL DEFAULT 'manual',
-    anonymization_version TEXT NOT NULL DEFAULT '1.0',
-    detail_level TEXT NOT NULL DEFAULT 'hashes',
-    original_hash TEXT UNIQUE NOT NULL,
-    tenant_id TEXT NOT NULL DEFAULT 'global',
-    submitted_at TEXT NOT NULL,
-    installation_fingerprint TEXT
-);
+_SCHEMA_STATEMENTS = [
+    "CREATE EXTENSION IF NOT EXISTS vector",
 
--- Indexes for common queries
-CREATE INDEX IF NOT EXISTS idx_incidents_domain ON anonymized_incidents(domain);
-CREATE INDEX IF NOT EXISTS idx_incidents_outcome ON anonymized_incidents(outcome);
-CREATE INDEX IF NOT EXISTS idx_incidents_tenant ON anonymized_incidents(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_incidents_submitted ON anonymized_incidents(submitted_at);
-CREATE INDEX IF NOT EXISTS idx_incidents_original_hash ON anonymized_incidents(original_hash);
+    """CREATE TABLE IF NOT EXISTS anonymized_incidents (
+        id SERIAL PRIMARY KEY,
+        incident_id TEXT UNIQUE NOT NULL,
+        cloud_id TEXT UNIQUE NOT NULL,
+        domain TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        created_at_hour TIMESTAMPTZ NOT NULL,
+        updated_at_hour TIMESTAMPTZ,
+        fingerprint_vector vector(31) NOT NULL,
+        fingerprint_json JSONB NOT NULL,
+        action_summary_json JSONB NOT NULL,
+        telemetry_pre_json JSONB,
+        telemetry_post_json JSONB,
+        surface_hashes_pre_json JSONB,
+        surface_hashes_post_json JSONB,
+        surface_drift_json JSONB,
+        drift_explanations_json JSONB,
+        control_surface_pre_json JSONB,
+        control_surface_post_json JSONB,
+        confidence REAL NOT NULL,
+        time_to_mitigate_sec INTEGER,
+        time_to_resolve_sec INTEGER,
+        trigger_source TEXT NOT NULL DEFAULT 'manual',
+        anonymization_version TEXT NOT NULL DEFAULT '1.0',
+        detail_level TEXT NOT NULL DEFAULT 'hashes',
+        original_hash TEXT UNIQUE NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT 'global',
+        submitted_at TIMESTAMPTZ NOT NULL,
+        installation_fingerprint TEXT
+    )""",
 
--- Surface hashes for drift correlation
-CREATE TABLE IF NOT EXISTS surface_hashes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cloud_id TEXT NOT NULL,
-    snapshot_type TEXT NOT NULL CHECK (snapshot_type IN ('pre', 'post')),
-    surface_key TEXT NOT NULL,
-    surface_hash TEXT NOT NULL,
-    FOREIGN KEY (cloud_id) REFERENCES anonymized_incidents(cloud_id) ON DELETE CASCADE
-);
+    "CREATE INDEX IF NOT EXISTS idx_incidents_domain ON anonymized_incidents(domain)",
+    "CREATE INDEX IF NOT EXISTS idx_incidents_outcome ON anonymized_incidents(outcome)",
+    "CREATE INDEX IF NOT EXISTS idx_incidents_tenant ON anonymized_incidents(tenant_id)",
+    "CREATE INDEX IF NOT EXISTS idx_incidents_submitted ON anonymized_incidents(submitted_at)",
 
-CREATE INDEX IF NOT EXISTS idx_surface_cloud_id ON surface_hashes(cloud_id);
-CREATE INDEX IF NOT EXISTS idx_surface_key_hash ON surface_hashes(surface_key, surface_hash);
+    """CREATE INDEX IF NOT EXISTS idx_incidents_fingerprint_vector
+        ON anonymized_incidents USING hnsw (fingerprint_vector vector_cosine_ops)""",
 
--- Certificate trust store
-CREATE TABLE IF NOT EXISTS trusted_certificates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cert_fingerprint TEXT UNIQUE NOT NULL,
-    organization TEXT NOT NULL,
-    installation_id TEXT,
-    common_name TEXT,
-    issued_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0,
-    revoked_at TEXT,
-    revoked_reason TEXT,
-    is_admin INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+    """CREATE TABLE IF NOT EXISTS surface_hashes (
+        id SERIAL PRIMARY KEY,
+        cloud_id TEXT NOT NULL,
+        snapshot_type TEXT NOT NULL CHECK (snapshot_type IN ('pre', 'post')),
+        surface_key TEXT NOT NULL,
+        surface_hash TEXT NOT NULL,
+        FOREIGN KEY (cloud_id) REFERENCES anonymized_incidents(cloud_id) ON DELETE CASCADE
+    )""",
 
-CREATE INDEX IF NOT EXISTS idx_certs_fingerprint ON trusted_certificates(cert_fingerprint);
-CREATE INDEX IF NOT EXISTS idx_certs_installation ON trusted_certificates(installation_id);
-CREATE INDEX IF NOT EXISTS idx_certs_revoked ON trusted_certificates(revoked);
-CREATE INDEX IF NOT EXISTS idx_certs_admin ON trusted_certificates(is_admin);
+    "CREATE INDEX IF NOT EXISTS idx_surface_cloud_id ON surface_hashes(cloud_id)",
+    "CREATE INDEX IF NOT EXISTS idx_surface_key_hash ON surface_hashes(surface_key, surface_hash)",
 
--- Audit log for security events
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    action TEXT NOT NULL,
-    actor_fingerprint TEXT,
-    actor_installation_id TEXT,
-    resource_type TEXT,
-    resource_id TEXT,
-    details TEXT
-);
+    """CREATE TABLE IF NOT EXISTS trusted_certificates (
+        id SERIAL PRIMARY KEY,
+        cert_fingerprint TEXT UNIQUE NOT NULL,
+        organization TEXT NOT NULL,
+        installation_id TEXT,
+        common_name TEXT,
+        issued_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        revoked BOOLEAN NOT NULL DEFAULT FALSE,
+        revoked_at TIMESTAMPTZ,
+        revoked_reason TEXT,
+        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
 
-CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
-CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
-CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_fingerprint);
+    "CREATE INDEX IF NOT EXISTS idx_certs_fingerprint ON trusted_certificates(cert_fingerprint)",
+    "CREATE INDEX IF NOT EXISTS idx_certs_installation ON trusted_certificates(installation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_certs_revoked ON trusted_certificates(revoked)",
+    "CREATE INDEX IF NOT EXISTS idx_certs_admin ON trusted_certificates(is_admin)",
 
--- Schema version tracking
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY
-);
-"""
+    """CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGSERIAL PRIMARY KEY,
+        timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+        action TEXT NOT NULL,
+        actor_fingerprint TEXT,
+        actor_installation_id TEXT,
+        resource_type TEXT,
+        resource_id TEXT,
+        details TEXT
+    )""",
+
+    "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_fingerprint)",
+
+    "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)",
+]
 
 
-# =============================================================================
-# Connection Management
-# =============================================================================
-
-
-def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
-    """Get a SQLite connection with proper settings."""
-    if db_path is None:
-        db_path = get_config().db_path
-
-    # Ensure parent directory exists with restricted permissions
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        db_path.parent.chmod(0o700)  # Restrict directory access
-    except OSError:
-        pass  # May fail on some filesystems
-
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-
-    # Restrict database file permissions after creation
-    if db_path.exists():
-        try:
-            db_path.chmod(0o600)  # Restrict file access
-        except OSError:
-            pass  # May fail on some filesystems
-
-    return conn
-
-
-@contextmanager
-def get_db() -> Generator[sqlite3.Connection, None, None]:
-    """Context manager for database connections."""
-    conn = get_connection()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: psycopg.Connection | None = None) -> None:
     """Ensure database schema is up to date."""
-    cursor = conn.cursor()
+    if conn is not None:
+        _ensure_schema_impl(conn)
+    else:
+        with get_db() as db_conn:
+            _ensure_schema_impl(db_conn)
 
-    # Check current version
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-    )
-    if not cursor.fetchone():
+
+def _ensure_schema_impl(conn: psycopg.Connection) -> None:
+    """Internal schema initialization."""
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+        "WHERE table_name = 'schema_version')"
+    ).fetchone()
+
+    if not row or not row["exists"]:
         # Fresh database - create schema
-        conn.executescript(SCHEMA_SQL)
-        cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-        conn.commit()
+        for stmt in _SCHEMA_STATEMENTS:
+            conn.execute(stmt)
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (%s)",
+            (SCHEMA_VERSION,),
+        )
         logger.info("Created database schema", version=SCHEMA_VERSION)
         return
 
     # Check version and migrate if needed
-    cursor.execute("SELECT version FROM schema_version")
-    row = cursor.fetchone()
-    current_version = row[0] if row else 0
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    current_version = row["version"] if row else 0
 
     if current_version < SCHEMA_VERSION:
-        # Run migrations
-        _migrate_schema(conn, current_version, SCHEMA_VERSION)
-
-
-def _migrate_schema(conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
-    """Run schema migrations."""
-    logger.info("Migrating schema", from_version=from_version, to_version=to_version)
-    cursor = conn.cursor()
-
-    # Migration from v1 to v2: add is_admin column and audit_log table
-    if from_version < 2:
-        # Add is_admin column to trusted_certificates
-        cursor.execute(
-            "ALTER TABLE trusted_certificates ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+        conn.execute(
+            "UPDATE schema_version SET version = %s",
+            (SCHEMA_VERSION,),
         )
-        # Create audit_log table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                action TEXT NOT NULL,
-                actor_fingerprint TEXT,
-                actor_installation_id TEXT,
-                resource_type TEXT,
-                resource_id TEXT,
-                details TEXT
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_fingerprint)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_certs_admin ON trusted_certificates(is_admin)")
-        logger.info("Migrated to schema v2: added is_admin column and audit_log table")
-
-    # Migration from v2 to v3: add drift explanations and control surface columns
-    if from_version < 3:
-        cursor.execute(
-            "ALTER TABLE anonymized_incidents ADD COLUMN drift_explanations_json TEXT"
+        logger.info(
+            "Migrated schema",
+            from_version=current_version,
+            to_version=SCHEMA_VERSION,
         )
-        cursor.execute(
-            "ALTER TABLE anonymized_incidents ADD COLUMN control_surface_pre_json TEXT"
-        )
-        cursor.execute(
-            "ALTER TABLE anonymized_incidents ADD COLUMN control_surface_post_json TEXT"
-        )
-        cursor.execute(
-            "ALTER TABLE anonymized_incidents ADD COLUMN detail_level TEXT NOT NULL DEFAULT 'hashes'"
-        )
-        logger.info("Migrated to schema v3: added drift explanations and control surfaces")
-
-    # Migration from v3 to v4: add vector_dimensions column
-    if from_version < 4:
-        cursor.execute(
-            "ALTER TABLE anonymized_incidents ADD COLUMN vector_dimensions INTEGER DEFAULT 15"
-        )
-        logger.info("Migrated to schema v4: added vector_dimensions column")
-
-    cursor.execute("UPDATE schema_version SET version = ?", (to_version,))
-    conn.commit()
 
 
 # =============================================================================
@@ -318,17 +291,6 @@ def fingerprint_to_vector(fp: Fingerprint) -> list[float]:
     ]
 
 
-def pack_vector(vector: list[float]) -> bytes:
-    """Pack a vector of floats into bytes for storage."""
-    return struct.pack(f"{len(vector)}f", *vector)
-
-
-def unpack_vector(data: bytes) -> list[float]:
-    """Unpack bytes into a vector of floats."""
-    count = len(data) // 4  # 4 bytes per float
-    return list(struct.unpack(f"{count}f", data))
-
-
 # =============================================================================
 # Incident Storage
 # =============================================================================
@@ -338,7 +300,7 @@ def store_incident(
     incident: AnonymizedIncidentReport,
     tenant_id: str = "global",
     installation_fingerprint: str | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> tuple[str, bool, str | None]:
     """Store an anonymized incident.
 
@@ -348,128 +310,121 @@ def store_incident(
         - accepted: True if newly stored, False if duplicate
         - duplicate_of: Cloud ID of existing incident if duplicate
     """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
+    if conn is not None:
+        return _store_incident_impl(conn, incident, tenant_id, installation_fingerprint)
+    with get_db() as db_conn:
+        return _store_incident_impl(db_conn, incident, tenant_id, installation_fingerprint)
 
-    assert conn is not None
 
-    try:
-        cursor = conn.cursor()
+def _store_incident_impl(
+    conn: psycopg.Connection,
+    incident: AnonymizedIncidentReport,
+    tenant_id: str,
+    installation_fingerprint: str | None,
+) -> tuple[str, bool, str | None]:
+    """Internal implementation of store_incident."""
+    # Check for duplicate by original_hash
+    row = conn.execute(
+        "SELECT cloud_id FROM anonymized_incidents WHERE original_hash = %s",
+        (incident.original_hash,),
+    ).fetchone()
 
-        # Check for duplicate by original_hash
-        cursor.execute(
-            "SELECT cloud_id FROM anonymized_incidents WHERE original_hash = ?",
-            (incident.original_hash,),
+    if row:
+        logger.debug("Duplicate incident detected", original_hash=incident.original_hash)
+        return row["cloud_id"], False, row["cloud_id"]
+
+    # Generate cloud ID with full UUID
+    cloud_id = f"cloud-{uuid.uuid4().hex}"
+
+    # Convert fingerprint to vector (pgvector handles list -> vector)
+    vector = fingerprint_to_vector(incident.fingerprint)
+
+    # Prepare drift explanations
+    drift_explanations = None
+    if incident.drift_explanations:
+        drift_explanations = [
+            de.model_dump() if hasattr(de, "model_dump") else de
+            for de in incident.drift_explanations
+        ]
+
+    # Insert incident
+    conn.execute(
+        """
+        INSERT INTO anonymized_incidents (
+            incident_id, cloud_id, domain, severity, status, outcome,
+            created_at_hour, updated_at_hour, fingerprint_vector, fingerprint_json,
+            action_summary_json, telemetry_pre_json, telemetry_post_json,
+            surface_hashes_pre_json, surface_hashes_post_json, surface_drift_json,
+            drift_explanations_json, control_surface_pre_json, control_surface_post_json,
+            confidence, time_to_mitigate_sec, time_to_resolve_sec,
+            trigger_source, anonymization_version, detail_level, original_hash,
+            tenant_id, submitted_at, installation_fingerprint
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s
         )
-        existing = cursor.fetchone()
-        if existing:
-            logger.debug("Duplicate incident detected", original_hash=incident.original_hash)
-            return existing["cloud_id"], False, existing["cloud_id"]
+        """,
+        (
+            incident.incident_id,
+            cloud_id,
+            incident.domain,
+            incident.severity,
+            incident.status,
+            incident.outcome,
+            incident.created_at_hour,
+            incident.updated_at_hour,
+            vector,
+            Jsonb(incident.fingerprint.model_dump()),
+            Jsonb(incident.action_summary.model_dump()),
+            Jsonb(incident.telemetry_pre) if incident.telemetry_pre else None,
+            Jsonb(incident.telemetry_post) if incident.telemetry_post else None,
+            Jsonb(incident.surface_hashes_pre) if incident.surface_hashes_pre else None,
+            Jsonb(incident.surface_hashes_post) if incident.surface_hashes_post else None,
+            Jsonb(incident.surface_drift) if incident.surface_drift else None,
+            Jsonb(drift_explanations) if drift_explanations else None,
+            Jsonb(incident.control_surface_pre) if incident.control_surface_pre else None,
+            Jsonb(incident.control_surface_post) if incident.control_surface_post else None,
+            incident.confidence,
+            incident.time_to_mitigate_sec,
+            incident.time_to_resolve_sec,
+            incident.trigger_source,
+            incident.anonymization_version,
+            incident.detail_level,
+            incident.original_hash,
+            tenant_id,
+            datetime.now(timezone.utc),
+            installation_fingerprint,
+        ),
+    )
 
-        # Generate cloud ID with full UUID for stronger entropy
-        cloud_id = f"cloud-{uuid.uuid4().hex}"
+    # Store surface hashes for indexing
+    if incident.surface_hashes_pre:
+        _store_surface_hashes(conn, cloud_id, "pre", incident.surface_hashes_pre)
+    if incident.surface_hashes_post:
+        _store_surface_hashes(conn, cloud_id, "post", incident.surface_hashes_post)
 
-        # Convert fingerprint to vector
-        vector = fingerprint_to_vector(incident.fingerprint)
-        vector_blob = pack_vector(vector)
-
-        # Prepare JSON fields
-        fingerprint_json = incident.fingerprint.model_dump_json()
-        action_summary_json = incident.action_summary.model_dump_json()
-        telemetry_pre_json = json.dumps(incident.telemetry_pre) if incident.telemetry_pre else None
-        telemetry_post_json = json.dumps(incident.telemetry_post) if incident.telemetry_post else None
-        surface_hashes_pre_json = json.dumps(incident.surface_hashes_pre) if incident.surface_hashes_pre else None
-        surface_hashes_post_json = json.dumps(incident.surface_hashes_post) if incident.surface_hashes_post else None
-        surface_drift_json = json.dumps(incident.surface_drift) if incident.surface_drift else None
-
-        # New fields for v3 schema
-        drift_explanations_json = None
-        if incident.drift_explanations:
-            drift_explanations_json = json.dumps([
-                de.model_dump() if hasattr(de, "model_dump") else de
-                for de in incident.drift_explanations
-            ])
-        control_surface_pre_json = json.dumps(incident.control_surface_pre) if incident.control_surface_pre else None
-        control_surface_post_json = json.dumps(incident.control_surface_post) if incident.control_surface_post else None
-
-        # Insert incident
-        cursor.execute(
-            """
-            INSERT INTO anonymized_incidents (
-                incident_id, cloud_id, domain, severity, status, outcome,
-                created_at_hour, updated_at_hour, fingerprint_vector, fingerprint_json,
-                action_summary_json, telemetry_pre_json, telemetry_post_json,
-                surface_hashes_pre_json, surface_hashes_post_json, surface_drift_json,
-                drift_explanations_json, control_surface_pre_json, control_surface_post_json,
-                confidence, time_to_mitigate_sec, time_to_resolve_sec,
-                trigger_source, anonymization_version, detail_level, original_hash,
-                tenant_id, submitted_at, installation_fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                incident.incident_id,
-                cloud_id,
-                incident.domain,
-                incident.severity,
-                incident.status,
-                incident.outcome,
-                incident.created_at_hour.isoformat(),
-                incident.updated_at_hour.isoformat() if incident.updated_at_hour else None,
-                vector_blob,
-                fingerprint_json,
-                action_summary_json,
-                telemetry_pre_json,
-                telemetry_post_json,
-                surface_hashes_pre_json,
-                surface_hashes_post_json,
-                surface_drift_json,
-                drift_explanations_json,
-                control_surface_pre_json,
-                control_surface_post_json,
-                incident.confidence,
-                incident.time_to_mitigate_sec,
-                incident.time_to_resolve_sec,
-                incident.trigger_source,
-                incident.anonymization_version,
-                incident.detail_level,
-                incident.original_hash,
-                tenant_id,
-                datetime.now(timezone.utc).isoformat(),
-                installation_fingerprint,
-            ),
-        )
-
-        # Store surface hashes for indexing
-        if incident.surface_hashes_pre:
-            _store_surface_hashes(cursor, cloud_id, "pre", incident.surface_hashes_pre)
-        if incident.surface_hashes_post:
-            _store_surface_hashes(cursor, cloud_id, "post", incident.surface_hashes_post)
-
-        if own_conn:
-            conn.commit()
-
-        logger.info("Stored incident", cloud_id=cloud_id, domain=incident.domain)
-        return cloud_id, True, None
-
-    finally:
-        if own_conn:
-            conn.close()
+    logger.info("Stored incident", cloud_id=cloud_id, domain=incident.domain)
+    return cloud_id, True, None
 
 
 def _store_surface_hashes(
-    cursor: sqlite3.Cursor,
+    conn: psycopg.Connection,
     cloud_id: str,
     snapshot_type: str,
     hashes: dict[str, str],
 ) -> None:
     """Store surface hashes for an incident."""
     for key, hash_value in hashes.items():
-        cursor.execute(
+        conn.execute(
             """
             INSERT INTO surface_hashes (cloud_id, snapshot_type, surface_key, surface_hash)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
             """,
             (cloud_id, snapshot_type, key, hash_value),
         )
@@ -478,226 +433,195 @@ def _store_surface_hashes(
 def get_incident(
     cloud_id: str,
     tenant_id: str | None = None,
-    conn: sqlite3.Connection | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> AnonymizedIncidentReport | None:
     """Get an incident by cloud ID.
 
     Args:
         cloud_id: The cloud ID of the incident.
-        tenant_id: Optional tenant ID for tenant isolation. If provided,
-                   only returns the incident if it belongs to this tenant.
+        tenant_id: Optional tenant ID for tenant isolation.
         conn: Optional database connection.
 
     Returns:
         The incident if found (and belongs to tenant if specified), None otherwise.
     """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
-        if tenant_id:
-            cursor.execute(
-                "SELECT * FROM anonymized_incidents WHERE cloud_id = ? AND tenant_id = ?",
-                (cloud_id, tenant_id),
-            )
-        else:
-            cursor.execute(
-                "SELECT * FROM anonymized_incidents WHERE cloud_id = ?",
-                (cloud_id,),
-            )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return _row_to_incident(row)
-    finally:
-        if own_conn:
-            conn.close()
+    if conn is not None:
+        return _get_incident_impl(conn, cloud_id, tenant_id)
+    with get_db() as db_conn:
+        return _get_incident_impl(db_conn, cloud_id, tenant_id)
 
 
-def _row_to_incident(row: sqlite3.Row) -> AnonymizedIncidentReport:
-    """Convert a database row to an AnonymizedIncidentReport."""
+def _get_incident_impl(
+    conn: psycopg.Connection,
+    cloud_id: str,
+    tenant_id: str | None,
+) -> AnonymizedIncidentReport | None:
+    """Internal implementation of get_incident."""
+    if tenant_id:
+        row = conn.execute(
+            "SELECT * FROM anonymized_incidents WHERE cloud_id = %s AND tenant_id = %s",
+            (cloud_id, tenant_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM anonymized_incidents WHERE cloud_id = %s",
+            (cloud_id,),
+        ).fetchone()
+
+    if not row:
+        return None
+    return _row_to_incident(row)
+
+
+def _row_to_incident(row: dict[str, Any]) -> AnonymizedIncidentReport:
+    """Convert a database row to an AnonymizedIncidentReport.
+
+    With PostgreSQL + psycopg3:
+    - JSONB columns are already deserialized as Python dicts/lists
+    - TIMESTAMPTZ columns are already datetime objects
+    - BOOLEAN columns are already Python bools
+    """
     from elle_cloud.models import DriftExplanation
 
-    fingerprint = Fingerprint.model_validate_json(row["fingerprint_json"])
-    action_summary = ActionSummary.model_validate_json(row["action_summary_json"])
+    # JSONB already deserialized by psycopg
+    fingerprint = Fingerprint.model_validate(row["fingerprint_json"])
+    action_summary = ActionSummary.model_validate(row["action_summary_json"])
 
-    # Parse drift explanations (v3 schema)
+    # Parse drift explanations (already deserialized from JSONB)
     drift_explanations: tuple[DriftExplanation, ...] = ()
-    drift_json = row["drift_explanations_json"] if "drift_explanations_json" in row.keys() else None
-    if drift_json:
+    if row.get("drift_explanations_json"):
         drift_explanations = tuple(
-            DriftExplanation.model_validate(de) for de in json.loads(drift_json)
+            DriftExplanation.model_validate(de) for de in row["drift_explanations_json"]
         )
-
-    # Parse control surfaces (v3 schema, detailed mode only)
-    control_pre = None
-    control_post = None
-    if "control_surface_pre_json" in row.keys():
-        control_pre = json.loads(row["control_surface_pre_json"]) if row["control_surface_pre_json"] else None
-    if "control_surface_post_json" in row.keys():
-        control_post = json.loads(row["control_surface_post_json"]) if row["control_surface_post_json"] else None
-
-    # Parse detail level (v3 schema)
-    detail_level = row["detail_level"] if "detail_level" in row.keys() else "hashes"
 
     return AnonymizedIncidentReport(
         incident_id=row["incident_id"],
-        created_at_hour=datetime.fromisoformat(row["created_at_hour"]),
-        updated_at_hour=datetime.fromisoformat(row["updated_at_hour"]) if row["updated_at_hour"] else None,
+        created_at_hour=row["created_at_hour"],
+        updated_at_hour=row["updated_at_hour"],
         domain=row["domain"],
         severity=row["severity"],
         status=row["status"],
         outcome=row["outcome"],
         fingerprint=fingerprint,
         action_summary=action_summary,
-        telemetry_pre=json.loads(row["telemetry_pre_json"]) if row["telemetry_pre_json"] else None,
-        telemetry_post=json.loads(row["telemetry_post_json"]) if row["telemetry_post_json"] else None,
-        surface_hashes_pre=json.loads(row["surface_hashes_pre_json"]) if row["surface_hashes_pre_json"] else None,
-        surface_hashes_post=json.loads(row["surface_hashes_post_json"]) if row["surface_hashes_post_json"] else None,
-        surface_drift=json.loads(row["surface_drift_json"]) if row["surface_drift_json"] else {},
+        telemetry_pre=row["telemetry_pre_json"],
+        telemetry_post=row["telemetry_post_json"],
+        surface_hashes_pre=row["surface_hashes_pre_json"],
+        surface_hashes_post=row["surface_hashes_post_json"],
+        surface_drift=row["surface_drift_json"] or {},
         drift_explanations=drift_explanations,
-        control_surface_pre=control_pre,
-        control_surface_post=control_post,
+        control_surface_pre=row.get("control_surface_pre_json"),
+        control_surface_post=row.get("control_surface_post_json"),
         confidence=row["confidence"],
         time_to_mitigate_sec=row["time_to_mitigate_sec"],
         time_to_resolve_sec=row["time_to_resolve_sec"],
         trigger_source=row["trigger_source"],
         anonymization_version=row["anonymization_version"],
-        detail_level=detail_level,
+        detail_level=row.get("detail_level", "hashes"),
         original_hash=row["original_hash"],
     )
 
 
 def get_incident_count(
     tenant_id: str | None = None,
-    conn: sqlite3.Connection | None = None,
 ) -> int:
     """Get total incident count."""
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
+    with get_db() as conn:
         if tenant_id:
-            cursor.execute(
-                "SELECT COUNT(*) FROM anonymized_incidents WHERE tenant_id = ?",
+            row = conn.execute(
+                "SELECT COUNT(*) as count FROM anonymized_incidents WHERE tenant_id = %s",
                 (tenant_id,),
-            )
+            ).fetchone()
         else:
-            cursor.execute("SELECT COUNT(*) FROM anonymized_incidents")
-        return cursor.fetchone()[0]
-    finally:
-        if own_conn:
-            conn.close()
+            row = conn.execute(
+                "SELECT COUNT(*) as count FROM anonymized_incidents"
+            ).fetchone()
+        assert row is not None
+        return row["count"]
 
 
 def get_domain_stats(
     domain: IncidentDomain,
     tenant_id: str | None = None,
-    conn: sqlite3.Connection | None = None,
 ) -> DomainStats:
     """Get aggregate statistics for a domain."""
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
-
-        # Base query
-        tenant_filter = " AND tenant_id = ?" if tenant_id else ""
+    with get_db() as conn:
+        tenant_filter = " AND tenant_id = %s" if tenant_id else ""
         params: list[Any] = [domain]
         if tenant_id:
             params.append(tenant_id)
 
         # Total count
-        cursor.execute(
-            f"SELECT COUNT(*) FROM anonymized_incidents WHERE domain = ?{tenant_filter}",
+        row = conn.execute(
+            f"SELECT COUNT(*) as count FROM anonymized_incidents "
+            f"WHERE domain = %s{tenant_filter}",
             params,
-        )
-        total = cursor.fetchone()[0]
+        ).fetchone()
+        assert row is not None
+        total = row["count"]
 
         if total == 0:
             return DomainStats(domain=domain)
 
         # Outcome distribution
-        cursor.execute(
+        rows = conn.execute(
             f"""
             SELECT outcome, COUNT(*) as count
             FROM anonymized_incidents
-            WHERE domain = ?{tenant_filter}
+            WHERE domain = %s{tenant_filter}
             GROUP BY outcome
             """,
             params,
-        )
-        outcome_counts = {row["outcome"]: row["count"] for row in cursor.fetchall()}
-        outcome_distribution = {
-            outcome: count / total for outcome, count in outcome_counts.items()
-        }
+        ).fetchall()
+        outcome_distribution = {r["outcome"]: r["count"] / total for r in rows}
 
         # Average times
-        cursor.execute(
+        row = conn.execute(
             f"""
             SELECT
                 AVG(time_to_resolve_sec) as avg_resolve,
                 AVG(time_to_mitigate_sec) as avg_mitigate,
                 AVG(confidence) as avg_confidence
             FROM anonymized_incidents
-            WHERE domain = ?{tenant_filter}
+            WHERE domain = %s{tenant_filter}
             """,
             params,
-        )
-        row = cursor.fetchone()
+        ).fetchone()
+        assert row is not None
         avg_resolve = row["avg_resolve"]
         avg_mitigate = row["avg_mitigate"]
-        avg_confidence = row["avg_confidence"] or 0.0
+        avg_confidence = float(row["avg_confidence"] or 0.0)
 
-        # Common entities (from fingerprint JSON)
-        # This is expensive - sample if dataset is large
+        # Common entities (sample recent incidents)
         entity_counts: dict[str, int] = {}
-        cursor.execute(
+        rows = conn.execute(
             f"""
             SELECT fingerprint_json
             FROM anonymized_incidents
-            WHERE domain = ?{tenant_filter}
+            WHERE domain = %s{tenant_filter}
             ORDER BY submitted_at DESC
             LIMIT 1000
             """,
             params,
-        )
-        for row in cursor.fetchall():
-            fp = Fingerprint.model_validate_json(row["fingerprint_json"])
+        ).fetchall()
+        for r in rows:
+            fp = Fingerprint.model_validate(r["fingerprint_json"])
             for entity in fp.entities:
                 entity_counts[entity] = entity_counts.get(entity, 0) + 1
 
-        # Sort by frequency
-        common_entities = sorted(entity_counts.keys(), key=lambda e: -entity_counts[e])[:10]
+        common_entities = sorted(
+            entity_counts.keys(), key=lambda e: -entity_counts[e]
+        )[:10]
 
         return DomainStats(
             domain=domain,
             total_incidents=total,
             outcome_distribution=outcome_distribution,
-            avg_time_to_resolve_sec=avg_resolve,
-            avg_time_to_mitigate_sec=avg_mitigate,
+            avg_time_to_resolve_sec=float(avg_resolve) if avg_resolve else None,
+            avg_time_to_mitigate_sec=float(avg_mitigate) if avg_mitigate else None,
             avg_confidence=avg_confidence,
             common_entities=common_entities,
         )
-
-    finally:
-        if own_conn:
-            conn.close()
 
 
 # =============================================================================
@@ -713,100 +637,80 @@ def register_certificate(
     issued_at: datetime,
     expires_at: datetime,
     is_admin: bool = False,
-    conn: sqlite3.Connection | None = None,
+    conn: psycopg.Connection | None = None,
 ) -> bool:
     """Register a trusted certificate.
 
     Uses atomic upsert to avoid race conditions.
 
-    Args:
-        cert_fingerprint: SHA-256 fingerprint of the certificate.
-        organization: Organization name.
-        installation_id: Optional installation identifier.
-        common_name: Certificate common name.
-        issued_at: Certificate issue date.
-        expires_at: Certificate expiration date.
-        is_admin: Whether this certificate has admin privileges.
-        conn: Optional database connection.
-
     Returns:
         True if newly registered, False if already exists.
     """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
-
-        # Atomic upsert to avoid race condition
-        cursor.execute(
-            """
-            INSERT INTO trusted_certificates (
-                cert_fingerprint, organization, installation_id, common_name,
-                issued_at, expires_at, is_admin
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(cert_fingerprint) DO NOTHING
-            """,
-            (
-                cert_fingerprint,
-                organization,
-                installation_id,
-                common_name,
-                issued_at.isoformat(),
-                expires_at.isoformat(),
-                1 if is_admin else 0,
-            ),
+    if conn is not None:
+        return _register_cert_impl(
+            conn, cert_fingerprint, organization, installation_id,
+            common_name, issued_at, expires_at, is_admin,
+        )
+    with get_db() as db_conn:
+        return _register_cert_impl(
+            db_conn, cert_fingerprint, organization, installation_id,
+            common_name, issued_at, expires_at, is_admin,
         )
 
-        if own_conn:
-            conn.commit()
 
-        if cursor.rowcount > 0:
-            logger.info(
-                "Registered certificate",
-                fingerprint=cert_fingerprint[:16] + "...",
-                organization=organization,
-                is_admin=is_admin,
-            )
-            return True
-        return False
+def _register_cert_impl(
+    conn: psycopg.Connection,
+    cert_fingerprint: str,
+    organization: str,
+    installation_id: str | None,
+    common_name: str | None,
+    issued_at: datetime,
+    expires_at: datetime,
+    is_admin: bool,
+) -> bool:
+    """Internal implementation of register_certificate."""
+    cur = conn.execute(
+        """
+        INSERT INTO trusted_certificates (
+            cert_fingerprint, organization, installation_id, common_name,
+            issued_at, expires_at, is_admin
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (cert_fingerprint) DO NOTHING
+        """,
+        (
+            cert_fingerprint, organization, installation_id, common_name,
+            issued_at, expires_at, is_admin,
+        ),
+    )
 
-    finally:
-        if own_conn:
-            conn.close()
+    if cur.rowcount and cur.rowcount > 0:
+        logger.info(
+            "Registered certificate",
+            fingerprint=cert_fingerprint[:16] + "...",
+            organization=organization,
+            is_admin=is_admin,
+        )
+        return True
+    return False
 
 
 def is_certificate_trusted(
     cert_fingerprint: str,
-    conn: sqlite3.Connection | None = None,
 ) -> tuple[bool, str | None]:
     """Check if a certificate is trusted.
 
     Returns:
         Tuple of (is_trusted, installation_id)
     """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
+    with get_db() as conn:
+        row = conn.execute(
             """
             SELECT installation_id, expires_at, revoked
             FROM trusted_certificates
-            WHERE cert_fingerprint = ?
+            WHERE cert_fingerprint = %s
             """,
             (cert_fingerprint,),
-        )
-        row = cursor.fetchone()
+        ).fetchone()
 
         if not row:
             return False, None
@@ -814,8 +718,7 @@ def is_certificate_trusted(
         if row["revoked"]:
             return False, None
 
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        # Handle both naive and timezone-aware datetimes
+        expires_at = row["expires_at"]
         now = datetime.now(timezone.utc)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
@@ -824,42 +727,26 @@ def is_certificate_trusted(
 
         return True, row["installation_id"]
 
-    finally:
-        if own_conn:
-            conn.close()
-
 
 def revoke_certificate(
     cert_fingerprint: str,
     reason: str = "manual revocation",
-    conn: sqlite3.Connection | None = None,
 ) -> bool:
     """Revoke a trusted certificate.
 
     Returns True if revoked, False if not found.
     """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
+    with get_db() as conn:
+        cur = conn.execute(
             """
             UPDATE trusted_certificates
-            SET revoked = 1, revoked_at = ?, revoked_reason = ?
-            WHERE cert_fingerprint = ?
+            SET revoked = TRUE, revoked_at = %s, revoked_reason = %s
+            WHERE cert_fingerprint = %s
             """,
-            (datetime.now(timezone.utc).isoformat(), reason, cert_fingerprint),
+            (datetime.now(timezone.utc), reason, cert_fingerprint),
         )
 
-        if own_conn:
-            conn.commit()
-
-        if cursor.rowcount > 0:
+        if cur.rowcount and cur.rowcount > 0:
             logger.warning(
                 "Revoked certificate",
                 fingerprint=cert_fingerprint[:16] + "...",
@@ -868,70 +755,38 @@ def revoke_certificate(
             return True
         return False
 
-    finally:
-        if own_conn:
-            conn.close()
-
 
 def list_certificates(
     include_revoked: bool = False,
-    conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
     """List all trusted certificates."""
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
+    with get_db() as conn:
         if include_revoked:
-            cursor.execute("SELECT * FROM trusted_certificates ORDER BY created_at DESC")
+            rows = conn.execute(
+                "SELECT * FROM trusted_certificates ORDER BY created_at DESC"
+            ).fetchall()
         else:
-            cursor.execute(
-                "SELECT * FROM trusted_certificates WHERE revoked = 0 ORDER BY created_at DESC"
-            )
+            rows = conn.execute(
+                "SELECT * FROM trusted_certificates "
+                "WHERE revoked = FALSE ORDER BY created_at DESC"
+            ).fetchall()
 
-        return [dict(row) for row in cursor.fetchall()]
-
-    finally:
-        if own_conn:
-            conn.close()
+        return [dict(row) for row in rows]
 
 
 def is_admin_certificate(
     cert_fingerprint: str,
-    conn: sqlite3.Connection | None = None,
 ) -> bool:
-    """Check if a certificate has admin privileges.
-
-    Args:
-        cert_fingerprint: SHA-256 fingerprint of the certificate.
-        conn: Optional database connection.
-
-    Returns:
-        True if the certificate is an admin certificate and is trusted.
-    """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
+    """Check if a certificate has admin privileges."""
+    with get_db() as conn:
+        row = conn.execute(
             """
             SELECT is_admin, expires_at, revoked
             FROM trusted_certificates
-            WHERE cert_fingerprint = ?
+            WHERE cert_fingerprint = %s
             """,
             (cert_fingerprint,),
-        )
-        row = cursor.fetchone()
+        ).fetchone()
 
         if not row:
             return False
@@ -943,7 +798,7 @@ def is_admin_certificate(
             return False
 
         # Check expiration
-        expires_at = datetime.fromisoformat(row["expires_at"])
+        expires_at = row["expires_at"]
         now = datetime.now(timezone.utc)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
@@ -952,9 +807,10 @@ def is_admin_certificate(
 
         return True
 
-    finally:
-        if own_conn:
-            conn.close()
+
+# =============================================================================
+# Audit Logging
+# =============================================================================
 
 
 def log_audit(
@@ -963,50 +819,26 @@ def log_audit(
     resource_type: str | None = None,
     resource_id: str | None = None,
     details: str = "",
-    conn: sqlite3.Connection | None = None,
 ) -> None:
-    """Log an audit event.
-
-    Args:
-        action: The action performed (e.g., "cert.register", "incident.submit").
-        actor: The authentication context of the actor.
-        resource_type: Type of resource affected (e.g., "certificate", "incident").
-        resource_id: ID of the affected resource.
-        details: Additional details about the action.
-        conn: Optional database connection.
-    """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-        ensure_schema(conn)
-
-    assert conn is not None
-
+    """Log an audit event."""
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO audit_log (
-                action, actor_fingerprint, actor_installation_id,
-                resource_type, resource_id, details
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                action,
-                actor.cert_fingerprint[:16] if actor and actor.cert_fingerprint else None,
-                actor.installation_id if actor else None,
-                resource_type,
-                resource_id,
-                details,
-            ),
-        )
-
-        if own_conn:
-            conn.commit()
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_log (
+                    action, actor_fingerprint, actor_installation_id,
+                    resource_type, resource_id, details
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    action,
+                    actor.cert_fingerprint[:16] if actor and actor.cert_fingerprint else None,
+                    actor.installation_id if actor else None,
+                    resource_type,
+                    resource_id,
+                    details,
+                ),
+            )
 
     except Exception as e:
         logger.warning("Failed to log audit event", error=str(e), action=action)
-
-    finally:
-        if own_conn:
-            conn.close()
