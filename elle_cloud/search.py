@@ -1,7 +1,7 @@
 """Vector search for similar incidents.
 
 Implements fingerprint-based similarity search using:
-- Cosine similarity on 15-dimensional fingerprint vectors
+- Cosine similarity on fingerprint vectors (15D or 31D, zero-padded)
 - Surface hash matching for drift correlation
 - Pre-filtering by domain/outcome for efficiency
 """
@@ -35,13 +35,18 @@ logger = structlog.get_logger()
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    if len(a) != len(b):
-        return 0.0
+    """Compute cosine similarity between two vectors.
 
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
+    Handles mixed-dimension vectors via zero-padding for backward
+    compatibility between old 15D and new 31D vectors.
+    """
+    max_len = max(len(a), len(b))
+    a_padded = a + [0.0] * (max_len - len(a))
+    b_padded = b + [0.0] * (max_len - len(b))
+
+    dot = sum(x * y for x, y in zip(a_padded, b_padded, strict=False))
+    norm_a = sum(x * x for x in a_padded) ** 0.5
+    norm_b = sum(x * x for x in b_padded) ** 0.5
 
     if norm_a == 0 or norm_b == 0:
         return 0.0

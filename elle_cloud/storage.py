@@ -40,7 +40,7 @@ logger = structlog.get_logger()
 # Schema
 # =============================================================================
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 -- Core incident storage
@@ -259,6 +259,13 @@ def _migrate_schema(conn: sqlite3.Connection, from_version: int, to_version: int
         )
         logger.info("Migrated to schema v3: added drift explanations and control surfaces")
 
+    # Migration from v3 to v4: add vector_dimensions column
+    if from_version < 4:
+        cursor.execute(
+            "ALTER TABLE anonymized_incidents ADD COLUMN vector_dimensions INTEGER DEFAULT 15"
+        )
+        logger.info("Migrated to schema v4: added vector_dimensions column")
+
     cursor.execute("UPDATE schema_version SET version = ?", (to_version,))
     conn.commit()
 
@@ -269,41 +276,45 @@ def _migrate_schema(conn: sqlite3.Connection, from_version: int, to_version: int
 
 
 def fingerprint_to_vector(fp: Fingerprint) -> list[float]:
-    """Convert Fingerprint to 15-dimensional vector for similarity search.
+    """Convert Fingerprint to 31-dimensional vector for similarity search.
 
-    Dimensions:
-    0: disk_pressure (0-1)
-    1: mem_pressure (0-1)
-    2: swap_pressure (0-1)
-    3: cpu_pressure (clamped to 0-1)
-    4: oom_count_1h (normalized)
-    5: net_flaps_1h (normalized)
-    6: service_failures_1h (normalized)
-    7: auth_failures_1h (normalized)
-    8: smart_pct_used_max (normalized)
-    9: smart_media_errors (normalized)
-    10: temp_max_c (normalized)
-    11: docker_exited_count (normalized)
-    12: entity_count (normalized)
-    13: has_oom (binary)
-    14: has_service_failures (binary)
+    Dimensions 0-14: Original fields (backward-compatible)
+    Dimensions 15-30: Monitoring sprint expansion fields
     """
     return [
-        fp.disk_pressure,
-        fp.mem_pressure,
-        fp.swap_pressure,
-        min(fp.cpu_pressure, 1.0),
-        min(fp.oom_count_1h / 10.0, 1.0),
-        min(fp.net_flaps_1h / 10.0, 1.0),
-        min(fp.service_failures_1h / 10.0, 1.0),
-        min(fp.auth_failures_1h / 10.0, 1.0),
-        min(fp.smart_pct_used_max / 100.0, 1.0),
-        min(fp.smart_media_errors / 10.0, 1.0),
-        min(fp.temp_max_c / 100.0, 1.0),
-        min(fp.docker_exited_count / 10.0, 1.0),
-        len(fp.entities) / 20.0 if fp.entities else 0.0,
-        1.0 if fp.oom_count_1h > 0 else 0.0,
-        1.0 if fp.service_failures_1h > 0 else 0.0,
+        # Original 15 dimensions (unchanged)
+        fp.disk_pressure,                                    # 0
+        fp.mem_pressure,                                     # 1
+        fp.swap_pressure,                                    # 2
+        min(fp.cpu_pressure, 1.0),                           # 3
+        min(fp.oom_count_1h / 10.0, 1.0),                   # 4
+        min(fp.net_flaps_1h / 10.0, 1.0),                   # 5
+        min(fp.service_failures_1h / 10.0, 1.0),            # 6
+        min(fp.auth_failures_1h / 10.0, 1.0),               # 7
+        min(fp.smart_pct_used_max / 100.0, 1.0),            # 8
+        min(fp.smart_media_errors / 10.0, 1.0),             # 9
+        min(fp.temp_max_c / 100.0, 1.0),                    # 10
+        min(fp.docker_exited_count / 10.0, 1.0),            # 11
+        len(fp.entities) / 20.0 if fp.entities else 0.0,    # 12
+        1.0 if fp.oom_count_1h > 0 else 0.0,                # 13
+        1.0 if fp.service_failures_1h > 0 else 0.0,         # 14
+        # New 16 dimensions (monitoring sprint)
+        fp.inode_pressure,                                    # 15
+        fp.io_latency_pressure,                               # 16
+        fp.conntrack_pressure,                                # 17
+        fp.tcp_retransmit_rate,                               # 18
+        min(fp.zombie_count / 20.0, 1.0),                    # 19
+        float(fp.pending_reboot),                             # 20
+        1.0 - min(fp.cert_expiry_days_min / 365.0, 1.0),    # 21
+        min(fp.dns_p95_ms / 1000.0, 1.0),                   # 22
+        fp.cgroup_mem_pressure,                               # 23
+        fp.psi_cpu_avg10,                                     # 24
+        fp.psi_memory_avg10,                                  # 25
+        min(fp.security_events_1h / 100.0, 1.0),            # 26
+        fp.gpu_mem_pressure,                                  # 27
+        fp.gpu_util_pressure,                                 # 28
+        fp.gpu_thermal_pressure,                              # 29
+        min(fp.gpu_ecc_errors_1h / 10.0, 1.0),              # 30
     ]
 
 

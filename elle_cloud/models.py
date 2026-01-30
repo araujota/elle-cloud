@@ -99,6 +99,67 @@ class Fingerprint(BaseModel):
     # Docker
     docker_exited_count: int = Field(ge=0, default=0)
 
+    # GPU metrics (0.0 if no GPU available)
+    gpu_mem_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Max GPU memory usage ratio across GPUs",
+    )
+    gpu_util_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Max GPU utilization ratio across GPUs",
+    )
+    gpu_thermal_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Max GPU temperature normalized (0=0C, 1=100C)",
+    )
+    gpu_ecc_errors_1h: int = Field(
+        ge=0, default=0,
+        description="GPU ECC errors in last hour",
+    )
+
+    # I/O and storage (monitoring sprint)
+    inode_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Max inode usage ratio across mounts",
+    )
+    io_latency_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Normalized I/O latency pressure (0=OK, 1=severe)",
+    )
+
+    # Network (monitoring sprint)
+    conntrack_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Conntrack table utilization",
+    )
+    tcp_retransmit_rate: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="TCP retransmit ratio",
+    )
+
+    # Process (monitoring sprint)
+    zombie_count: int = Field(ge=0, default=0, description="Number of zombie processes")
+
+    # System state (monitoring sprint)
+    pending_reboot: int = Field(ge=0, le=1, default=0, description="1 if reboot required")
+    cert_expiry_days_min: int = Field(ge=0, default=365, description="Min days until cert expires")
+
+    # DNS (monitoring sprint)
+    dns_p95_ms: float = Field(ge=0.0, default=0.0, description="DNS query p95 latency in ms")
+
+    # Cgroup (monitoring sprint)
+    cgroup_mem_pressure: float = Field(
+        ge=0.0, le=1.0, default=0.0,
+        description="Max cgroup memory utilization",
+    )
+
+    # PSI (monitoring sprint)
+    psi_cpu_avg10: float = Field(ge=0.0, le=1.0, default=0.0, description="CPU PSI some avg10")
+    psi_memory_avg10: float = Field(ge=0.0, le=1.0, default=0.0, description="Memory PSI some avg10")
+
+    # Security (monitoring sprint)
+    security_events_1h: int = Field(ge=0, default=0, description="Security events in last hour")
+
     # Custom features (extensible)
     custom: dict[str, Any] = Field(default_factory=dict)
 
