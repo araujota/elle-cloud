@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 import psycopg
+import psycopg.sql
 import structlog
 
 from elle_cloud.config import get_config
@@ -97,35 +98,37 @@ def _search_similar_impl(
     # Convert query fingerprint to vector
     query_vector = fingerprint_to_vector(query.fingerprint)
 
-    # Build query with pgvector cosine distance
+    # Build query using psycopg.sql for safe SQL composition
     # <=> returns cosine distance (0 = identical, 2 = opposite)
     # similarity = 1 - distance
-    sql = """
-        SELECT *,
-            1 - (fingerprint_vector <=> %s::vector) as fp_similarity
-        FROM anonymized_incidents
-        WHERE 1=1
-    """
+    parts: list[psycopg.sql.Composable] = [
+        psycopg.sql.SQL("""
+            SELECT *,
+                1 - (fingerprint_vector <=> %s::vector) as fp_similarity
+            FROM anonymized_incidents
+            WHERE 1=1
+        """),
+    ]
     params: list[Any] = [query_vector]
 
     if query.domain:
-        sql += " AND domain = %s"
+        parts.append(psycopg.sql.SQL(" AND domain = %s"))
         params.append(query.domain)
 
     if query.outcome:
-        sql += " AND outcome = %s"
+        parts.append(psycopg.sql.SQL(" AND outcome = %s"))
         params.append(query.outcome)
 
     if tenant_id:
-        sql += " AND tenant_id = %s"
+        parts.append(psycopg.sql.SQL(" AND tenant_id = %s"))
         params.append(tenant_id)
 
     # Order by vector distance (uses HNSW index) and fetch candidates
-    sql += " ORDER BY fingerprint_vector <=> %s::vector LIMIT %s"
+    parts.append(psycopg.sql.SQL(" ORDER BY fingerprint_vector <=> %s::vector LIMIT %s"))
     params.append(query_vector)
     params.append(config.search_limit * 10)
 
-    rows = conn.execute(sql, params).fetchall()
+    rows = conn.execute(psycopg.sql.Composed(parts), params).fetchall()
 
     total_searched = len(rows)
     if total_searched == 0:
@@ -215,26 +218,28 @@ def search_by_surface_hash(
     config/service had the same hash value.
     """
     with get_db() as conn:
-        sql = """
-            SELECT DISTINCT i.*
-            FROM anonymized_incidents i
-            JOIN surface_hashes s ON i.cloud_id = s.cloud_id
-            WHERE s.surface_key = %s AND s.surface_hash = %s
-        """
+        parts: list[psycopg.sql.Composable] = [
+            psycopg.sql.SQL("""
+                SELECT DISTINCT i.*
+                FROM anonymized_incidents i
+                JOIN surface_hashes s ON i.cloud_id = s.cloud_id
+                WHERE s.surface_key = %s AND s.surface_hash = %s
+            """),
+        ]
         params: list[Any] = [surface_key, surface_hash]
 
         if snapshot_type:
-            sql += " AND s.snapshot_type = %s"
+            parts.append(psycopg.sql.SQL(" AND s.snapshot_type = %s"))
             params.append(snapshot_type)
 
         if tenant_id:
-            sql += " AND i.tenant_id = %s"
+            parts.append(psycopg.sql.SQL(" AND i.tenant_id = %s"))
             params.append(tenant_id)
 
-        sql += " ORDER BY i.submitted_at DESC LIMIT %s"
+        parts.append(psycopg.sql.SQL(" ORDER BY i.submitted_at DESC LIMIT %s"))
         params.append(limit)
 
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(psycopg.sql.Composed(parts), params).fetchall()
 
         return [_row_to_incident(row) for row in rows]
 

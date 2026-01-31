@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import psycopg
+import psycopg.sql
 import structlog
 from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
@@ -546,15 +547,20 @@ def get_domain_stats(
 ) -> DomainStats:
     """Get aggregate statistics for a domain."""
     with get_db() as conn:
-        tenant_filter = " AND tenant_id = %s" if tenant_id else ""
+        tenant_clause = (
+            psycopg.sql.SQL(" AND tenant_id = %s") if tenant_id
+            else psycopg.sql.SQL("")
+        )
         params: list[Any] = [domain]
         if tenant_id:
             params.append(tenant_id)
 
         # Total count
         row = conn.execute(
-            f"SELECT COUNT(*) as count FROM anonymized_incidents "
-            f"WHERE domain = %s{tenant_filter}",
+            psycopg.sql.SQL(
+                "SELECT COUNT(*) as count FROM anonymized_incidents "
+                "WHERE domain = %s"
+            ) + tenant_clause,
             params,
         ).fetchone()
         assert row is not None
@@ -565,26 +571,25 @@ def get_domain_stats(
 
         # Outcome distribution
         rows = conn.execute(
-            f"""
-            SELECT outcome, COUNT(*) as count
-            FROM anonymized_incidents
-            WHERE domain = %s{tenant_filter}
-            GROUP BY outcome
-            """,
+            psycopg.sql.SQL("""
+                SELECT outcome, COUNT(*) as count
+                FROM anonymized_incidents
+                WHERE domain = %s
+            """) + tenant_clause + psycopg.sql.SQL(" GROUP BY outcome"),
             params,
         ).fetchall()
         outcome_distribution = {r["outcome"]: r["count"] / total for r in rows}
 
         # Average times
         row = conn.execute(
-            f"""
-            SELECT
-                AVG(time_to_resolve_sec) as avg_resolve,
-                AVG(time_to_mitigate_sec) as avg_mitigate,
-                AVG(confidence) as avg_confidence
-            FROM anonymized_incidents
-            WHERE domain = %s{tenant_filter}
-            """,
+            psycopg.sql.SQL("""
+                SELECT
+                    AVG(time_to_resolve_sec) as avg_resolve,
+                    AVG(time_to_mitigate_sec) as avg_mitigate,
+                    AVG(confidence) as avg_confidence
+                FROM anonymized_incidents
+                WHERE domain = %s
+            """) + tenant_clause,
             params,
         ).fetchone()
         assert row is not None
@@ -595,13 +600,14 @@ def get_domain_stats(
         # Common entities (sample recent incidents)
         entity_counts: dict[str, int] = {}
         rows = conn.execute(
-            f"""
-            SELECT fingerprint_json
-            FROM anonymized_incidents
-            WHERE domain = %s{tenant_filter}
-            ORDER BY submitted_at DESC
-            LIMIT 1000
-            """,
+            psycopg.sql.SQL("""
+                SELECT fingerprint_json
+                FROM anonymized_incidents
+                WHERE domain = %s
+            """) + tenant_clause + psycopg.sql.SQL("""
+                ORDER BY submitted_at DESC
+                LIMIT 1000
+            """),
             params,
         ).fetchall()
         for r in rows:

@@ -15,6 +15,9 @@ cryptography>=42.0.0
 # Logging
 structlog>=24.1.0
 
+# Transitive dependency pins (security)
+zipp>=3.19.1
+
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
