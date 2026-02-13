@@ -10,7 +10,7 @@ pydantic-settings>=2.1.0
 slowapi>=0.1.9
 
 # Cryptography
-cryptography>=42.0.0
+cryptography>=46.0.5
 
 # Logging
 structlog>=24.1.0
